@@ -1,0 +1,161 @@
+body {
+    margin: 0;
+    padding: 0;
+    font-family: Arial, sans-serif;
+    background-color: #f4f4f4;
+    position: relative;
+    min-height: 100vh;
+}
+
+.background-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background-image: url('/static/images/bg.jpg');  /* Single background image */
+    background-size: cover;
+    background-position: center;
+    opacity: 1;
+    z-index: -1;
+}
+
+.container {
+    position: relative;
+    width: 90%;
+    max-width: 1200px;
+    margin: 20px auto;
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 20px;
+    background-image: url('/static/images/bg2.jpg');  /* Single background image */
+    background-size: cover;
+    background-position: center;
+    opacity: 1;
+    /* background-color: rgba(255, 255, 255, 0.9);   */
+    padding: 20px;
+    border-radius: 10px;
+    box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+}
+
+h1 {
+    color: #ffffff;
+    margin-bottom: 10px;
+}
+
+#controls {
+    margin: 10px 0;
+    width: 100%;
+    text-align: center;
+}
+
+#video-container {
+    position: relative;
+    width: 800px;
+    height: 600px;
+    border: 2px solid #ccc;
+    overflow: hidden;
+    margin: 0 auto;
+    background-color: #000;
+}
+
+#video-stream {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    z-index: 1;
+}
+
+#canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: all;
+    z-index: 2;
+    background: transparent;
+}
+
+.btn {
+    display: inline-block;
+    padding: 10px 20px;
+    margin: 5px;
+    font-size: 16px;
+    cursor: pointer;
+    background-color: #4285F4;
+    color: #fff;
+    border: none;
+    border-radius: 5px;
+}
+
+.btn:hover {
+    background-color: #357AE8;
+}
+
+#analytics-container {
+    display: flex;
+    justify-content: space-around;
+    flex-wrap: wrap;
+    gap: 20px;
+    margin: 20px 0;
+    width: 100%;
+}
+
+.stat-box {
+    background-color: #fff;
+    padding: 15px;
+    border-radius: 8px;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+    min-width: 150px;
+    text-align: center;
+}
+
+.stat-box h3 {
+    margin: 0 0 10px 0;
+    color: #4285F4;
+    font-size: 1.1em;
+}
+
+.stat-box p {
+    margin: 0;
+    font-size: 1.2em;
+    font-weight: bold;
+    color: #333;
+}
+
+.stat-box.alert {
+    background-color: #fff3f3;
+    border: 1px solid #ffcdd2;
+}
+
+.stat-box.alert h3 {
+    color: #d32f2f;
+}
+
+.control-group {
+    margin: 15px 0;
+    padding: 10px;
+    background-color: rgba(255, 255, 255, 0.9);
+    border-radius: 5px;
+}
+
+.form-select {
+    padding: 8px;
+    margin: 10px;
+    border-radius: 5px;
+    border: 1px solid #ccc;
+    min-width: 200px;
+}
+
+#perimeter-select-container {
+    margin-top: 10px;
+}
+
+/* Add event listener for save button */
+document.getElementById('save-perimeter').addEventListener('click', saveCurrentPerimeter);
