@@ -322,13 +322,13 @@ def save_incident_to_db_sync(incident_type: str, details: str):
         logger.error(f"Database connection error: {e}")
 
 def save_data_sync(incidents, analytics_data):
-    """Synchronous version for background tasks - THIS IS THE MAIN FUNCTION"""
+    """Synchronous version for background tasks - calls both save incidents and save analytics"""
     try:
         # Save incidents
         for incident_type, details in incidents:
             save_incident_to_db_sync(incident_type, details)
         
-        # Save analytics if needed
+        # Save analytics 
         if incidents or analytics_data["unusualBehavior"]:
             save_analytics_to_db_sync(analytics_data)
             
@@ -505,7 +505,7 @@ async def index(request: Request):
                                       {"request": request})
 
 @app.get("/video_feed")
-def video_feed(background_tasks: BackgroundTasks):  # Add BackgroundTasks parameter
+def video_feed(background_tasks: BackgroundTasks): 
     def generate():
         while True:
             try:
@@ -529,7 +529,6 @@ def video_feed(background_tasks: BackgroundTasks):  # Add BackgroundTasks parame
                 tracked_objects = detect_and_track(frame)
                 person_in_region, incidents = check_region(tracked_objects, app_state.shape_coordinates, frame)
 
-                # Use BackgroundTasks instead of asyncio.create_task
                 if incidents or app_state.analytics["unusualBehavior"]:
                     background_tasks.add_task(
                         save_data_sync, 
@@ -537,7 +536,6 @@ def video_feed(background_tasks: BackgroundTasks):  # Add BackgroundTasks parame
                         app_state.analytics.copy()
                     )
 
-                # Encode and yield frame
                 ret, buffer = cv2.imencode('.jpg', frame)
                 frame_bytes = buffer.tobytes()
                 yield (b'--frame\r\n'
