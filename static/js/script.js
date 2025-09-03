@@ -26,6 +26,9 @@ function initCanvas() {
     // Ensure video is visible
     videoElement.style.display = 'block';
     
+    // Setup metadata handlers
+    setupVideoMetadataHandler();
+    
     // Redraw shape if exists
     if (points.length > 0) {
         drawShape();
@@ -115,12 +118,44 @@ function drawShape() {
     });
 }
 
-function sendShapeCoordinates(){
+function sendShapeCoordinates() {
     const { scaleX, scaleY } = getScalingFactors();
-    const scaledPoints = points.map(point => ({
-        x: Math.round(point.x * scaleX),
-        y: Math.round(point.y * scaleY)
-    }));
+    
+    // Get video element to check actual display dimensions
+    const videoElement = document.getElementById('video-stream');
+    const videoContainer = document.getElementById('video-container');
+    
+    // Calculate the actual display size of the video within the container
+    let displayWidth, displayHeight;
+    const videoAspect = (videoElement.videoWidth || videoElement.naturalWidth) / 
+                        (videoElement.videoHeight || videoElement.naturalHeight);
+    const containerAspect = videoContainer.offsetWidth / videoContainer.offsetHeight;
+    
+    if (videoAspect > containerAspect) {
+        // Video is wider than container (letterboxing)
+        displayWidth = videoContainer.offsetWidth;
+        displayHeight = displayWidth / videoAspect;
+    } else {
+        // Video is taller than container (pillarboxing)
+        displayHeight = videoContainer.offsetHeight;
+        displayWidth = displayHeight * videoAspect;
+    }
+    
+    // Calculate offsets for letterboxing/pillarboxing
+    const xOffset = (videoContainer.offsetWidth - displayWidth) / 2;
+    const yOffset = (videoContainer.offsetHeight - displayHeight) / 2;
+    
+    const scaledPoints = points.map(point => {
+        // Adjust for letterboxing/pillarboxing
+        const adjustedX = point.x - xOffset;
+        const adjustedY = point.y - yOffset;
+        
+        // Scale to actual video dimensions
+        return {
+            x: Math.round(adjustedX * (videoElement.videoWidth || videoElement.naturalWidth) / displayWidth),
+            y: Math.round(adjustedY * (videoElement.videoHeight || videoElement.naturalHeight) / displayHeight)
+        };
+    });
 
     fetch('/set_shape', {
         method: 'POST',
@@ -199,89 +234,269 @@ setInterval(() => {
 
 function getScalingFactors() {
     const videoElement = document.getElementById('video-stream');
-    const naturalWidth = videoElement.naturalWidth || 640;  // fallback width
-    const naturalHeight = videoElement.naturalHeight || 480;  // fallback height
+    const videoContainer = document.getElementById('video-container');
     
-    return {
-        scaleX: naturalWidth / canvas.width,
-        scaleY: naturalHeight / canvas.height
+    // Get the intrinsic dimensions of the video stream
+    let naturalWidth, naturalHeight;
+    
+    if (videoElement.complete || videoElement.naturalWidth) {
+        // For image elements that have loaded
+        naturalWidth = videoElement.naturalWidth;
+        naturalHeight = videoElement.naturalHeight;
+    } else if (videoElement.videoWidth) {
+        // For video elements
+        naturalWidth = videoElement.videoWidth;
+        naturalHeight = videoElement.videoHeight;
+    } else {
+        // Fallback to container dimensions if actual dimensions aren't available
+        naturalWidth = videoContainer.offsetWidth;
+        naturalHeight = videoContainer.offsetHeight;
+        console.warn('Using container dimensions as fallback. This may cause scaling issues.');
+    }
+    
+    console.log(`Video natural dimensions: ${naturalWidth}x${naturalHeight}`);
+    console.log(`Canvas dimensions: ${canvas.width}x${canvas.height}`);
+    
+    // Calculate aspect ratios to handle letterboxing/pillarboxing
+    const videoAspect = naturalWidth / naturalHeight;
+    const canvasAspect = canvas.width / canvas.height;
+    
+    let scaleX, scaleY;
+    
+    if (videoAspect > canvasAspect) {
+        // Video is wider than canvas (letterboxing)
+        const displayHeight = canvas.width / videoAspect;
+        const yOffset = (canvas.height - displayHeight) / 2;
+        
+        scaleX = naturalWidth / canvas.width;
+        scaleY = naturalHeight / displayHeight;
+    } else {
+        // Video is taller than canvas (pillarboxing)
+        const displayWidth = canvas.height * videoAspect;
+        const xOffset = (canvas.width - displayWidth) / 2;
+        
+        scaleX = naturalWidth / displayWidth;
+        scaleY = naturalHeight / canvas.height;
+    }
+    
+    console.log(`Scaling factors: X=${scaleX}, Y=${scaleY}`);
+    return { scaleX, scaleY };
+}
+
+function setupVideoMetadataHandler() {
+    const videoElement = document.getElementById('video-stream');
+    
+    // For image elements
+    videoElement.onload = function() {
+        console.log('Image loaded, dimensions available');
+        // Redraw any existing shapes with correct scaling
+        if (points.length > 0) {
+            drawShape();
+        }
+    };
+    
+    // For video elements (in case the stream is treated as video)
+    videoElement.onloadedmetadata = function() {
+        console.log('Video metadata loaded, dimensions available');
+        // Redraw any existing shapes with correct scaling
+        if (points.length > 0) {
+            drawShape();
+        }
     };
 }
 
-function saveCurrentPerimeter() {
+// Add this function (it's missing from your current script.js)
+async function saveCurrentPerimeter() {
     if (points.length === 0) {
-        alert('Please draw a perimeter first');
+        alert('No perimeter drawn to save!');
         return;
     }
     
-    const name = prompt('Enter a name for this perimeter:');
+    const name = prompt('Enter perimeter name:');
     if (!name) return;
     
-    const { scaleX, scaleY } = getScalingFactors();
-    const scaledPoints = points.map(point => ({
-        x: Math.round(point.x * scaleX),
-        y: Math.round(point.y * scaleY)
-    }));
-
-    fetch('/save_perimeter', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-            name: name,
-            points: scaledPoints
-        })
-    })
-    .then(response => response.json())
-    .then(data => {
-        if (data.status === 'success') {
-            alert(`Perimeter "${name}" saved successfully`);
-            loadPerimeters();
+    try {
+        const { scaleX, scaleY } = getScalingFactors();
+        const videoElement = document.getElementById('video-stream');
+        const videoContainer = document.getElementById('video-container');
+        
+        // Calculate the actual display size of the video within the container
+        let displayWidth, displayHeight;
+        const videoAspect = (videoElement.videoWidth || videoElement.naturalWidth) / (videoElement.videoHeight || videoElement.naturalHeight);
+        const containerAspect = videoContainer.offsetWidth / videoContainer.offsetHeight;
+        
+        if (videoAspect > containerAspect) {
+            displayWidth = videoContainer.offsetWidth;
+            displayHeight = displayWidth / videoAspect;
         } else {
-            alert(`Error saving perimeter: ${data.message}`);
+            displayHeight = videoContainer.offsetHeight;
+            displayWidth = displayHeight * videoAspect;
         }
-    })
-    .catch(error => {
-        console.error('Error:', error);
-        alert('Error saving perimeter. Check console for details.');
-    });
+        
+        const xOffset = (videoContainer.offsetWidth - displayWidth) / 2;
+        const yOffset = (videoContainer.offsetHeight - displayHeight) / 2;
+        
+        const scaledPoints = points.map(point => {
+            const adjustedX = point.x - xOffset;
+            const adjustedY = point.y - yOffset;
+            return {
+                x: Math.round(adjustedX * (videoElement.videoWidth || videoElement.naturalWidth) / displayWidth),
+                y: Math.round(adjustedY * (videoElement.videoHeight || videoElement.naturalHeight) / displayHeight)
+            };
+        });
+        
+        const response = await fetch('/save_perimeter', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                name: name,
+                points: scaledPoints
+            })
+        });
+        
+        const data = await response.json();
+        if (data.status === 'success') {
+            alert('Perimeter saved successfully!');
+            loadPerimeters(); // Refresh the dropdown
+        } else {
+            alert('Error saving perimeter: ' + data.message);
+        }
+    } catch (error) {
+        console.error('Error saving perimeter:', error);
+        alert('Error saving perimeter!');
+    }
 }
+
 
 function loadPerimeters() {
     fetch('/get_perimeters')
-        .then(response => response.json())
-        .then(perimeters => {
-            console.log('Loaded perimeters:', perimeters);  // Debug log
-            const container = document.getElementById('perimeter-select-container');
-            if (perimeters.length === 0) {
-                container.innerHTML = '<p>No saved perimeters</p>';
-                return;
-            }
-            
+    .then(response => response.json())
+    .then(data => {
+        const container = document.getElementById('perimeter-select-container');
+        
+        // Check if the response has the expected structure
+        if (data.status === 'success' && data.perimeters && data.perimeters.length > 0) {
             container.innerHTML = `
                 <select id="perimeter-select" class="form-select">
-                    <option value="">Select a perimeter</option>
-                    ${perimeters.map(p => `
-                        <option value='${JSON.stringify(p.points)}'>
-                            ${p.name}
-                        </option>
-                    `).join('')}
+                    <option value="">Select a saved perimeter</option>
+                    ${data.perimeters.map(p => 
+                        `<option value='${JSON.stringify(p.points)}' data-id='${p.id}'>${p.name}</option>`
+                    ).join('')}
                 </select>
+                <button class="btn" onclick="deleteSelectedPerimeter()">Delete Selected</button>
             `;
-            
-            document.getElementById('perimeter-select').addEventListener('change', function(e) {
+        } else if (data.status === 'error') {
+            container.innerHTML = `<div class="error">Error: ${data.message}</div>`;
+        } else {
+            container.innerHTML = '<div class="info">No saved perimeters</div>';
+        }
+        
+        // Add event listener for perimeter selection
+        const selectElement = document.getElementById('perimeter-select');
+        if (selectElement) {
+            selectElement.addEventListener('change', function(e) {
                 if (this.value) {
-                    points = JSON.parse(this.value);
-                    drawShape();
-                    sendShapeCoordinates();
+                    const perimeterPoints = JSON.parse(this.value);
+                    loadPerimeterPoints(perimeterPoints);
                 }
             });
-        })
-        .catch(error => {
-            console.error('Error loading perimeters:', error);
-            const container = document.getElementById('perimeter-select-container');
-            container.innerHTML = '<p>Error loading perimeters</p>';
-        });
+        }
+    })
+    .catch(error => {
+        console.error('Error loading perimeters:', error);
+        const container = document.getElementById('perimeter-select-container');
+        container.innerHTML = '<div class="error">Error loading perimeters</div>';
+    });
 }
+
+// Add this helper function for loading perimeter points
+function loadPerimeterPoints(perimeterPoints) {
+    const videoElement = document.getElementById('video-stream');
+    const videoContainer = document.getElementById('video-container');
+    
+    // Calculate the actual display size of the video within the container
+    let displayWidth, displayHeight;
+    const videoAspect = (videoElement.videoWidth || videoElement.naturalWidth) / (videoElement.videoHeight || videoElement.naturalHeight);
+    const containerAspect = videoContainer.offsetWidth / videoContainer.offsetHeight;
+    
+    if (videoAspect > containerAspect) {
+        displayWidth = videoContainer.offsetWidth;
+        displayHeight = displayWidth / videoAspect;
+    } else {
+        displayHeight = videoContainer.offsetHeight;
+        displayWidth = displayHeight * videoAspect;
+    }
+    
+    const xOffset = (videoContainer.offsetWidth - displayWidth) / 2;
+    const yOffset = (videoContainer.offsetHeight - displayHeight) / 2;
+    
+    // Convert backend coordinates to canvas coordinates
+    points = perimeterPoints.map(point => {
+        const scaledX = point.x * displayWidth / (videoElement.videoWidth || videoElement.naturalWidth);
+        const scaledY = point.y * displayHeight / (videoElement.videoHeight || videoElement.naturalHeight);
+        return {
+            x: Math.round(scaledX + xOffset),
+            y: Math.round(scaledY + yOffset)
+        };
+    });
+    
+    drawShape();
+    sendShapeCoordinates();
+}
+
+async function deleteSelectedPerimeter() {
+    const selectElement = document.getElementById('perimeter-select');
+    if (!selectElement || !selectElement.value) {
+        alert('Please select a perimeter to delete');
+        return;
+    }
+    
+    const selectedOption = selectElement.options[selectElement.selectedIndex];
+    const perimeterId = selectedOption.getAttribute('data-id'); // We need to modify the option creation
+    
+    if (!perimeterId) {
+        alert('Unable to delete perimeter');
+        return;
+    }
+    
+    if (!confirm(`Are you sure you want to delete "${selectedOption.text}"?`)) {
+        return;
+    }
+    
+    try {
+        const response = await fetch(`/delete_perimeter/${perimeterId}`, {
+            method: 'DELETE'
+        });
+        
+        const data = await response.json();
+        if (data.status === 'success') {
+            alert('Perimeter deleted successfully!');
+            points = []; // Clear current perimeter
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            loadPerimeters(); // Refresh the dropdown
+        } else {
+            alert('Error deleting perimeter: ' + data.message);
+        }
+    } catch (error) {
+        console.error('Error deleting perimeter:', error);
+        alert('Error deleting perimeter!');
+    }
+}
+
+
+
+function debugVideoDimensions() {
+    const videoElement = document.getElementById('video-stream');
+    const videoContainer = document.getElementById('video-container');
+    
+    console.log('Video element:', videoElement);
+    console.log('Natural dimensions:', videoElement.naturalWidth, 'x', videoElement.naturalHeight);
+    console.log('Video dimensions:', videoElement.videoWidth, 'x', videoElement.videoHeight);
+    console.log('Container dimensions:', videoContainer.offsetWidth, 'x', videoContainer.offsetHeight);
+    console.log('Canvas dimensions:', canvas.width, 'x', canvas.height);
+}
+
+setInterval(debugVideoDimensions, 5000);
 

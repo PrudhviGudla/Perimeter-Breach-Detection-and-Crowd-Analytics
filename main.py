@@ -1,55 +1,36 @@
-from fastapi import FastAPI, Request, Body  #, BackgroundTasks
+from fastapi import FastAPI, Request, Body, Depends, BackgroundTasks
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
-from fastapi.staticfiles import StaticFiles  
+from fastapi.staticfiles import StaticFiles
+import time
 import cv2
 import numpy as np
-# import threading
-# import requests
-import time
 import math
 import paho.mqtt.client as mqtt
 import logging
 from shapely.geometry import Point, Polygon
-import asyncio
-from motor.motor_asyncio import AsyncIOMotorClient
 from datetime import datetime, timezone
 from typing import Dict, Any
 import os
 from dotenv import load_dotenv
-from pymongo import MongoClient
 from contextlib import asynccontextmanager
 from ultralytics import YOLO
 from sort import *
+import uvicorn
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+import json
+from typing import Annotated
+import asyncio
+import signal
+import sys
+import os
 
+# Load environment variables
+load_dotenv()
 
-# Setup function
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("Application starting up...")
-    try:
-        # Initialize MongoDB connection
-        await db_client.client.admin.command("ping")
-        logger.info("Successfully connected to MongoDB")
-    except Exception as e:
-        logger.error(f"Failed to connect to MongoDB: {e}")
-    
-    yield
-    # Shutdown
-    logger.info("Application shutting down...")
-    if cap.isOpened():
-        cap.release()
-    mqtt_client.loop_stop()
-    mqtt_client.disconnect()
-    if db_client:
-        db_client.client.close()
-
-app = FastAPI(lifespan=lifespan)
-templates = Jinja2Templates(directory="templates")
-
-# Mount the static files directory
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
+# logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
@@ -60,90 +41,303 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Load environment variables
-load_dotenv()
-
-# MongoDB setup
-MONGO_URI = os.getenv('MONGO_URI', 'mongodb://localhost:27017')
-
-class Database:
-    client: AsyncIOMotorClient = None
-    db = None
-
-    @classmethod
-    def get_database(cls):
-        if not cls.client:
-            try:
-                cls.client = AsyncIOMotorClient(MONGO_URI, maxPoolSize=10)
-                cls.db = cls.client.perimeter_detection
-                logger.info("MongoDB client initialized successfully")
-            except Exception as e:
-                logger.error(f"Failed to initialize MongoDB client: {e}")
-        return cls.db
-
-# Initialize database and collections
-db_client = Database()
-db = db_client.get_database()
-analytics_collection = db['analytics']
-incidents_collection = db['incidents']
-perimeters_collection = db['perimeters']
-
-# Global variables
-shape_coordinates = None
-buzzer_on = True
-set_line_mode = False
 mqtt_client = mqtt.Client(client_id="perimeter_detection_backend")
 mqtt_broker = 'broker.emqx.io'
 mqtt_port = 1883
 mqtt_topic = "esp32/buzzer"
-analytics = {
-    "peopleCount": 0,
-    "crowdDensity": "Low",
-    "breachCount": 0,
-    "unusualBehavior": False,
-    "behaviorDetails": []
-}
 
-# Initialize YOLOv8 model
-model = YOLO("yolov8l.pt")
-model.fuse()
-CLASS_NAMES_DICT = model.model.names
 
-# Initialize SORT tracker
-tracker = Sort(max_age=20, min_hits=3, iou_threshold=0.3)
+class AppState:
+    def __init__(self):
+        self.shape_coordinates = None
+        self.buzzer_on = True
+        self.analytics = {
+            "peopleCount": 0,
+            "crowdDensity": "Low",
+            "breachCount": 0,
+            "unusualBehavior": False,
+            "behaviorDetails": []
+        }
+app_state = AppState()
 
-# Video capture
-cap = cv2.VideoCapture(0)
+class ResourceManager:
+    """Centralized management for camera, database, and MQTT resources"""
+    
+    def __init__(self):
+        self.cap = None
+        self.engine = None
+        self.Session = None
+        self.mqtt_client = None
+        self.model = None
+        self.tracker = None
+        
+    def initialize_database(self):
+        """Initialize database connection and create tables"""
+        try:
+            db_path = 'perimeter_detection.db'
+            self.engine = create_engine(f'sqlite:///{db_path}', echo=True)
+            logger.info(f"Database path: {os.path.abspath(db_path)}")
+            Base.metadata.create_all(self.engine)
+            self.Session = sessionmaker(bind=self.engine)
+            logger.info("Database initialized successfully")
+            
+            # Initialize test data
+            self._initialize_test_data()
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize database: {e}")
+            raise
+    
+    def _initialize_test_data(self):
+        """Add test data to database"""
+        try:
+            session = self.Session()
+            # Check if test data already exists
+            existing = session.query(Analytics).first()
+            if not existing:
+                test_analytics = Analytics(
+                    timestamp=datetime.now(timezone.utc),
+                    people_count=0,
+                    crowd_density="Low",
+                    breach_count=0,
+                    unusual_behavior=False,
+                    behavior_details=json.dumps([])
+                )
+                session.add(test_analytics)
+                
+                test_perimeter = Perimeter(
+                    name="Test Perimeter",
+                    points=json.dumps([[0,0], [100,0], [100,100], [0,100]]),
+                    timestamp=datetime.now(timezone.utc)
+                )
+                session.add(test_perimeter)
+                session.commit()
+                logger.info("Test data initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize test data: {e}")
+        finally:
+            session.close()
+    
+    def initialize_camera(self):
+        """Initialize camera connection"""
+        ip_cam_url = os.getenv('IP_WEBCAM_URL', '0')
+        self.cap = cv2.VideoCapture(ip_cam_url)
+        
+        if not self.cap.isOpened():
+            logger.warning(f"Failed to connect to IP webcam at {ip_cam_url}")
+            self.cap = cv2.VideoCapture(0)
+            if not self.cap.isOpened():
+                logger.error("Failed to open any camera source")
+                self.cap = None
+                return False
+        
+        logger.info("Camera initialized successfully")
+        return True
+    
+    def initialize_mqtt(self):
+        """Initialize MQTT client"""
+        self.mqtt_client = mqtt.Client(client_id="perimeter_detection_backend")
+        
+        def on_connect(client, userdata, flags, rc):
+            if rc == 0:
+                logger.info("Successfully connected to MQTT broker")
+            else:
+                logger.error(f"Failed to connect to MQTT broker with code: {rc}")
+        
+        def on_disconnect(client, userdata, rc):
+            logger.warning(f"Disconnected from MQTT broker with code: {rc}")
+        
+        self.mqtt_client.on_connect = on_connect
+        self.mqtt_client.on_disconnect = on_disconnect
+        
+        try:
+            self.mqtt_client.connect('broker.emqx.io', 1883, 60)
+            self.mqtt_client.loop_start()
+            logger.info("MQTT client started")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to connect to MQTT broker: {e}")
+            return False
+    
+    def initialize_ai_models(self):
+        """Initialize YOLO model and SORT tracker"""
+        try:
+            self.model = YOLO("yolov8l.pt")
+            self.model.fuse()
+            self.tracker = Sort(max_age=20, min_hits=3, iou_threshold=0.3)
+            self.CLASS_NAMES_DICT = self.model.model.names
+            logger.info("AI models initialized successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to initialize AI models: {e}")
+            return False
+    
+    def cleanup(self):
+        """Clean up all resources"""
+        if self.cap and self.cap.isOpened():
+            self.cap.release()
+        if self.mqtt_client:
+            self.mqtt_client.loop_stop()
+            self.mqtt_client.disconnect()
+        logger.info("Resources cleaned up")
 
-#----------------------------------------------------------------------------------------
-# Add MQTT callbacks
-def on_connect(client, userdata, flags, rc):
-    if rc == 0:
-        logging.info("Successfully connected to MQTT broker")
-        client.subscribe(mqtt_topic)
-    else:
-        logging.error(f"Failed to connect to MQTT broker with code: {rc}")
+# Create global resource manager
+resource_manager = ResourceManager()
 
-def on_disconnect(client, userdata, rc):
-    logging.warning(f"Disconnected from MQTT broker with code: {rc}")
 
-def on_publish(client, userdata, mid):
-    logging.debug(f"Message {mid} published successfully")
+shutdown_event = asyncio.Event()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifecycle with proper shutdown handling"""
+    
+    # Setup signal handlers that work with asyncio
+    def signal_handler(sig, frame):
+        logger.info(f"Received signal {sig}, initiating shutdown...")
+        shutdown_event.set()
+    
+    # Install handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    if sys.platform.startswith('win'):
+        signal.signal(signal.SIGBREAK, signal_handler)
+    
+    logger.info("Application starting up...")
+    
+    # Initialize resources
+    resource_manager.initialize_database()
+    resource_manager.initialize_camera()
+    resource_manager.initialize_mqtt()
+    resource_manager.initialize_ai_models()
+    
+    try:
+        yield
+    finally:
+        # Cleanup
+        logger.info("Application shutting down...")
+        resource_manager.cleanup()
+        
+        # Cancel remaining tasks
+        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        if tasks:
+            logger.info(f"Cancelling {len(tasks)} outstanding tasks")
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-mqtt_client.on_connect = on_connect
-mqtt_client.on_disconnect = on_disconnect
-mqtt_client.on_publish = on_publish
 
-# Update MQTT connection with better error handling
-try:
-    mqtt_client.connect(mqtt_broker, mqtt_port, 60)
-    mqtt_client.loop_start()
-    logging.info("MQTT client started")
-except Exception as e:
-    logging.error(f"Failed to connect to MQTT broker: {e}")
+# app initialization
+app = FastAPI(lifespan=lifespan)
+templates = Jinja2Templates(directory="templates")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-#----------------------------------------------------------------------------------
 
+def get_session():
+    """Database session dependency"""
+    if not resource_manager.Session:
+        raise RuntimeError("Database not initialized")
+    
+    session = resource_manager.Session()
+    try:
+        yield session
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Database session error: {e}")
+        raise
+    finally:
+        session.close()
+SessionDep = Annotated[Session, Depends(get_session)]
+
+
+Base = declarative_base()
+
+class Analytics(Base):
+    __tablename__ = 'analytics'
+    id = Column(Integer, primary_key=True)
+    timestamp = Column(DateTime)
+    people_count = Column(Integer)
+    crowd_density = Column(String)
+    breach_count = Column(Integer)
+    unusual_behavior = Column(Boolean)
+    behavior_details = Column(String)  
+
+class Incident(Base):
+    __tablename__ = 'incidents'
+    id = Column(Integer, primary_key=True)
+    type = Column(String)
+    details = Column(String)
+    timestamp = Column(DateTime)
+
+class Perimeter(Base):
+    __tablename__ = 'perimeters'
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    points = Column(String)  
+    timestamp = Column(DateTime)
+
+
+# Saving Data to database
+def save_analytics_to_db_sync(analytics_data: Dict[str, Any]):
+    """Synchronous version for background tasks"""
+    try:
+        session = resource_manager.Session()
+        try:
+            analytics_record = Analytics(
+                timestamp=datetime.now(timezone.utc),
+                people_count=analytics_data['peopleCount'],
+                crowd_density=analytics_data['crowdDensity'],
+                breach_count=analytics_data['breachCount'],
+                unusual_behavior=analytics_data['unusualBehavior'],
+                behavior_details=json.dumps(analytics_data['behaviorDetails'])
+            )
+            session.add(analytics_record)
+            session.commit()
+            logger.info("Analytics saved successfully")
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Failed to save analytics: {e}")
+        finally:
+            session.close()
+    except Exception as e:
+        logger.error(f"Database connection error: {e}")
+
+def save_incident_to_db_sync(incident_type: str, details: str):
+    """Synchronous version for background tasks"""
+    try:
+        session = resource_manager.Session()
+        try:
+            incident = Incident(
+                type=incident_type,
+                details=details,
+                timestamp=datetime.now(timezone.utc)
+            )
+            session.add(incident)
+            session.commit()
+            logger.info("Incident saved successfully")
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Failed to save incident: {e}")
+        finally:
+            session.close()
+    except Exception as e:
+        logger.error(f"Database connection error: {e}")
+
+def save_data_sync(incidents, analytics_data):
+    """Synchronous version for background tasks - THIS IS THE MAIN FUNCTION"""
+    try:
+        # Save incidents
+        for incident_type, details in incidents:
+            save_incident_to_db_sync(incident_type, details)
+        
+        # Save analytics if needed
+        if incidents or analytics_data["unusualBehavior"]:
+            save_analytics_to_db_sync(analytics_data)
+            
+        logger.info("Data saved successfully in background")
+    except Exception as e:
+        logger.error(f"Error saving data in background: {e}")
+
+
+# Analytics and Detection Utilities
 def point_in_polygon(point, polygon_points):
     if not polygon_points:
         return False
@@ -156,7 +350,7 @@ def detect_and_track(frame):
     try:
         logger.debug("Starting object detection and tracking")
         detections = np.empty((0, 5))
-        results = model(frame, stream=True)
+        results = resource_manager.model(frame, stream=True)
 
         for r in results:
             boxes = r.boxes
@@ -165,14 +359,14 @@ def detect_and_track(frame):
                 x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
                 
                 cls = int(box.cls[0])
-                currentClass = CLASS_NAMES_DICT[cls]
+                currentClass = resource_manager.CLASS_NAMES_DICT[cls]
                 conf = math.ceil(box.conf[0] * 100) / 100
 
                 if conf > 0.5 and currentClass == "person":
                     currentArray = np.array([x1, y1, x2, y2, conf])
                     detections = np.vstack((detections, currentArray))
 
-        resultTracker = tracker.update(detections)
+        resultTracker = resource_manager.tracker.update(detections)
         tracked_objects = []
 
         for res in resultTracker:
@@ -201,50 +395,7 @@ def calculate_crowd_density(people_count):
         return "Medium"
     else:
         return "High"
-
-#---------------------------------------------------------------------------------
-async def save_analytics_to_db(analytics_data: Dict[str, Any]):
-    try:
-        analytics_data['timestamp'] = datetime.now(timezone.utc)
-        result = await analytics_collection.insert_one(analytics_data)
-        if result.inserted_id:
-            logger.info(f"Analytics saved with ID: {result.inserted_id}")
-        else:
-            logger.error("Failed to save analytics")
-    except Exception as e:
-        logger.error(f"Failed to save analytics to database: {e}")
-
-async def save_incident_to_db(incident_type: str, details: str):
-    try:
-        incident = {
-            'type': incident_type,
-            'details': details,
-            'timestamp': datetime.now(timezone.utc)
-        }
-        result = await incidents_collection.insert_one(incident)
-        if result.inserted_id:
-            logger.info(f"Incident saved with ID: {result.inserted_id}")
-        else:
-            logger.error("Failed to save incident")
-    except Exception as e:
-        logger.error(f"Failed to save incident to database: {e}")
-
-async def save_data(incidents, analytics_data):
-    try:
-        # Save incidents
-        for incident_type, details in incidents:
-            await save_incident_to_db(incident_type, details)
-        
-        # Save analytics if there are incidents or unusual behavior
-        if incidents or analytics_data["unusualBehavior"]:
-            await save_analytics_to_db(analytics_data.copy())
-            
-        logger.info("Data saved successfully")
-    except Exception as e:
-        logger.error(f"Error saving data to database: {e}")
-
-#--------------------------------------------------------------------------------------
-
+    
 def detect_unusual_behavior(tracked_objects, frame):
     try:
         unusual_behaviors = []
@@ -284,18 +435,17 @@ def detect_unusual_behavior(tracked_objects, frame):
         return []
 
 def check_region(tracked_objects, polygon_points, frame):
-    global buzzer_on, analytics
     person_in_region = False
     incidents_to_save = [] 
     
-    # Update basic analytics
-    analytics["peopleCount"] = len(tracked_objects)
-    analytics["crowdDensity"] = calculate_crowd_density(len(tracked_objects))
+    # Update basic analytics using app_state
+    app_state.analytics["peopleCount"] = len(tracked_objects)
+    app_state.analytics["crowdDensity"] = calculate_crowd_density(len(tracked_objects))
     
     # Detect unusual behavior
     unusual_behaviors = detect_unusual_behavior(tracked_objects, frame)
-    analytics["unusualBehavior"] = len(unusual_behaviors) > 0
-    analytics["behaviorDetails"] = unusual_behaviors
+    app_state.analytics["unusualBehavior"] = len(unusual_behaviors) > 0
+    app_state.analytics["behaviorDetails"] = unusual_behaviors
 
     # Draw and check polygon
     if polygon_points:
@@ -318,124 +468,184 @@ def check_region(tracked_objects, polygon_points, frame):
         
         if polygon_points and point_in_polygon(center, polygon_points):
             person_in_region = True
-            analytics["breachCount"] += 1
+            app_state.analytics["breachCount"] += 1
             cv2.putText(frame, 'ALERT: Breach', (50, 50),
                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-            buzzer_on = True
-            send_buzzer_signal()
+            app_state.buzzer_on = True
+            MQTTHandler.send_buzzer_signal(True)
             incidents_to_save.append(("breach", f"Person ID {id} breached perimeter"))
 
     return person_in_region, incidents_to_save
 
-def send_buzzer_signal():
-    try:
-        result = mqtt_client.publish(mqtt_topic, "ON")
-        if result.rc == mqtt.MQTT_ERR_SUCCESS:
-            logging.info("Buzzer ON signal sent successfully")
-        else:
-            logging.error(f"Failed to send buzzer ON signal, error code: {result.rc}")
-    except Exception as e:
-        logging.error(f"Failed to send MQTT message: {e}")
 
-def send_buzzer_off_signal():
-    try:
-        result = mqtt_client.publish(mqtt_topic, "OFF")
-        if result.rc == mqtt.MQTT_ERR_SUCCESS:
-            logging.info("Buzzer OFF signal sent successfully")
-        else:
-            logging.error(f"Failed to send buzzer OFF signal, error code: {result.rc}")
-    except Exception as e:
-        logging.error(f"Failed to send MQTT message: {e}")
+# For handling MQTT messages
+class MQTTHandler:
+    @staticmethod
+    def send_buzzer_signal(state: bool):
+        """Simplified MQTT signal sending"""
+        if not resource_manager.mqtt_client:
+            logger.error("MQTT client not initialized")
+            return False
+        
+        try:
+            message = "ON" if state else "OFF"
+            result = resource_manager.mqtt_client.publish("esp32/buzzer", message)
+            success = result.rc == mqtt.MQTT_ERR_SUCCESS
+            logger.info(f"Buzzer {message} signal sent: {'success' if success else 'failed'}")
+            return success
+        except Exception as e:
+            logger.error(f"Failed to send MQTT message: {e}")
+            return False
 
-#---------------------------------------------------------------------------------------------------------------------
-def generate_frames():
-    global shape_coordinates, buzzer_on
-    
-    async def process_frame():
-        while True:
-            success, frame = cap.read()
-            if not success:
-                break
 
-            tracked_objects = detect_and_track(frame)
-            person_in_region, incidents = check_region(tracked_objects, shape_coordinates, frame)
-
-            # Create a background task for saving data
-            if incidents or analytics["unusualBehavior"]:
-                asyncio.create_task(save_data(incidents, analytics.copy()))
-
-            ret, buffer = cv2.imencode('.jpg', frame)
-            frame_bytes = buffer.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-            
-            await asyncio.sleep(0.03)
-
-    return StreamingResponse(process_frame(), media_type="multipart/x-mixed-replace; boundary=frame")
-
-#-----------------------------------------------------------------------------------------------------------
+# web app routes
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     return templates.TemplateResponse("index.html",
                                       {"request": request})
 
 @app.get("/video_feed")
-def video_feed():
-    return generate_frames()
+def video_feed(background_tasks: BackgroundTasks):  # Add BackgroundTasks parameter
+    def generate():
+        while True:
+            try:
+                if not resource_manager.cap or not resource_manager.cap.isOpened():
+                    # Return error frame
+                    blank_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                    cv2.putText(blank_frame, "Camera Not Available", (180, 240),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                    ret, buffer = cv2.imencode('.jpg', blank_frame)
+                    frame_bytes = buffer.tobytes()
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+                    time.sleep(1)
+                    continue
 
-@app.post("/set_shape")
-async def set_shape(data: dict = Body(...)):
-    global shape_coordinates
-    shape_coordinates = [(p['x'], p['y']) for p in data['points']]
-    return {"status": "success"}
+                # Read and process frame (synchronous)
+                success, frame = resource_manager.cap.read()
+                if not success:
+                    continue
+
+                tracked_objects = detect_and_track(frame)
+                person_in_region, incidents = check_region(tracked_objects, app_state.shape_coordinates, frame)
+
+                # Use BackgroundTasks instead of asyncio.create_task
+                if incidents or app_state.analytics["unusualBehavior"]:
+                    background_tasks.add_task(
+                        save_data_sync, 
+                        incidents, 
+                        app_state.analytics.copy()
+                    )
+
+                # Encode and yield frame
+                ret, buffer = cv2.imencode('.jpg', frame)
+                frame_bytes = buffer.tobytes()
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+                
+                time.sleep(0.033)  # ~30 FPS
+                
+            except Exception as e:
+                logger.error(f"Error processing frame: {e}")
+                time.sleep(0.1)
+
+    return StreamingResponse(generate(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 @app.post("/toggle_buzzer")
 async def toggle_buzzer():
-    global buzzer_on
-    buzzer_on = not buzzer_on
-    if buzzer_on:
-        send_buzzer_signal()
-    else:
-        send_buzzer_off_signal()
-    return JSONResponse({"buzzer_on": buzzer_on})
-
-@app.get("/get_buzzer_state")
-async def get_buzzer_state():
-    global buzzer_on
-    return JSONResponse({"buzzer_on": buzzer_on})
+    app_state.buzzer_on = not app_state.buzzer_on
+    success = MQTTHandler.send_buzzer_signal(app_state.buzzer_on)
+    return JSONResponse({
+        "buzzer_on": app_state.buzzer_on, 
+        "mqtt_success": success
+    })
 
 @app.get("/get_analytics")
 async def get_analytics():
-    return JSONResponse(analytics)
+    return JSONResponse(app_state.analytics)
+
+@app.post("/set_shape")
+async def set_shape(data: dict = Body(...)):
+    app_state.shape_coordinates = [(p['x'], p['y']) for p in data['points']]
+    return {"status": "success", "message": "Perimeter shape updated"}
+
+@app.get("/get_buzzer_state")
+async def get_buzzer_state():
+    """Get current buzzer state"""
+    return JSONResponse({"buzzer_on": app_state.buzzer_on})
 
 @app.post("/save_perimeter")
-async def save_perimeter(data: dict = Body(...)):
+async def save_perimeter(data: dict = Body(...), session: SessionDep = None):
+    """Save perimeter configuration"""
     try:
-        perimeter = {
-            'name': data['name'],
-            'points': data['points'],
-            'timestamp': datetime.now(timezone.utc)
-        }
-        result = await perimeters_collection.insert_one(perimeter)
-        if result.inserted_id:
-            logger.info(f"Perimeter saved with ID: {result.inserted_id}")
-            return {"status": "success", "message": "Perimeter saved successfully", "id": str(result.inserted_id)}
-        else:
-            return {"status": "error", "message": "Failed to save perimeter"}
+        perimeter = Perimeter(
+            name=data['name'],
+            points=json.dumps(data['points']),
+            timestamp=datetime.now(timezone.utc)
+        )
+        session.add(perimeter)
+        session.commit()
+        return {"status": "success", "message": "Perimeter saved successfully", "id": perimeter.id}
     except Exception as e:
+        session.rollback()
         logger.error(f"Error saving perimeter: {e}")
         return {"status": "error", "message": str(e)}
 
 @app.get("/get_perimeters")
-async def get_perimeters():
+async def get_perimeters(session: SessionDep = None):
+    """Get all saved perimeters"""
     try:
-        perimeters = await perimeters_collection.find().to_list(length=None)
-        logger.info(f"Retrieved {len(perimeters)} perimeters")
-        return [{"id": str(p["_id"]), "name": p["name"], "points": p["points"]} for p in perimeters]
+        perimeters = session.query(Perimeter).all()
+        result = [{
+            "id": p.id,
+            "name": p.name,
+            "points": json.loads(p.points),
+            "timestamp": p.timestamp.isoformat() if p.timestamp else None
+        } for p in perimeters]
+        return {"status": "success", "perimeters": result}
     except Exception as e:
         logger.error(f"Error fetching perimeters: {e}")
-        return []
+        return {"status": "error", "message": str(e)}
+
+@app.post("/load_perimeter/{perimeter_id}")
+async def load_perimeter(perimeter_id: int, session: SessionDep = None):
+    """Load a saved perimeter and set it as current"""
+    try:
+        perimeter = session.query(Perimeter).filter(Perimeter.id == perimeter_id).first()
+        if not perimeter:
+            return {"status": "error", "message": "Perimeter not found"}
+        
+        app_state.shape_coordinates = json.loads(perimeter.points)
+        return {
+            "status": "success", 
+            "message": "Perimeter loaded successfully",
+            "perimeter": {
+                "id": perimeter.id,
+                "name": perimeter.name,
+                "points": app_state.shape_coordinates
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error loading perimeter: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.delete("/delete_perimeter/{perimeter_id}")
+async def delete_perimeter(perimeter_id: int, session: SessionDep = None):
+    """Delete a saved perimeter"""
+    try:
+        perimeter = session.query(Perimeter).filter(Perimeter.id == perimeter_id).first()
+        if not perimeter:
+            return {"status": "error", "message": "Perimeter not found"}
+        
+        session.delete(perimeter)
+        session.commit()
+        return {"status": "success", "message": "Perimeter deleted successfully"}
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Error deleting perimeter: {e}")
+        return {"status": "error", "message": str(e)}
+
+
 
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

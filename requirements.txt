@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+jinja2
+python-dotenv
+opencv-python-headless
+numpy
+shapely
+ultralytics
+asyncio
+scikit-image
+glob2
+filterpy
+argparse
+sqlalchemy
+paho-mqtt

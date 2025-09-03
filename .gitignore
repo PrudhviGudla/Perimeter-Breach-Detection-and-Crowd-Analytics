@@ -3,8 +3,13 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# C extensions
 *.so
+
+# Other
+yolov8l.pt
+perimeter_detection.db
+app.log
+pb_env/
 
 # Distribution / packaging
 .Python
