@@ -41,7 +41,9 @@ pip install -r requirements.txt
 
 ### Configuration
 1. **Camera Setup**: Configure your camera URL in `.env` file:
+```
 IP_WEBCAM_URL=<url>
+```
 Or use local camera (default: camera index 0)
 
 2. **MQTT Configuration**: Update MQTT settings in the code if needed:
@@ -67,8 +69,8 @@ Access the web interface at: `http://localhost:8000`
 - Breadboard (optional)
 
 ### Wiring
-ESP32 Pin D4 ──── Buzzer Positive
-ESP32 GND ──── Buzzer Negative
+ESP32 Pin D4 ─ Buzzer Positive
+ESP32 GND ─ Buzzer Negative
 
 ### Software Setup
 1. Install Arduino IDE with ESP32 board support
