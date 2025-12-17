@@ -1,6 +1,6 @@
 # Perimeter Breach Detection and Crowd Analytics
 
-A real-time computer vision application that detects perimeter breaches and provides crowd analytics using YOLOv8 object detection, SORT tracking, and IoT integration via MQTT. Built with FastAPI for the web interface and SQLite for data persistence.
+A real-time computer vision application that detects perimeter breaches and provides crowd analytics using YOLOv8 object detection, SORT tracking, and IoT integration via MQTT. Built with FastAPI for the web interface, SQLite for data persistence, and Apache Kafka for scalable video ingestion.
 
 ## Features
 
@@ -20,128 +20,198 @@ A real-time computer vision application that detects perimeter breaches and prov
 
 ### Advanced Analytics
 - **People Counting**: Accurate real-time headcount
-- **Crowd Density Classification**: Low/Medium/High density analysis  
+- **Crowd Density Classification**: Low/Medium/High density analysis  
 - **Behavior Detection**: Rapid movement and clustering detection
 - **Historical Data**: Incident logging and analytics storage
 
+### Distributed Architecture (Kafka)
+- **Decoupled Ingestion**: Separates video capture (Producer) from inference (Consumer)
+- **High Throughput**: Capable of handling high-resolution streams via optimized Kafka pipelines
+- **Scalability**: Architecture supports adding multiple camera producers without modifying the core backend
+
+## Performance Engineering & Optimizations
+
+This project implements a highly optimized **Asyncio + Multithreading** architecture to maximize FPS and server responsiveness.
+
+### 1. Asynchronous Non-Blocking Server
+- **Problem**: Standard Python web servers block the Event Loop during heavy CPU tasks (like AI inference), causing the UI to freeze.
+- **Solution**: Utilized `asyncio` and `asyncio.to_thread` to offload blocking I/O (camera reading) and CPU-bound tasks (YOLO inference) to worker threads.
+- **Result**: The main Event Loop remains free to handle API requests (like dashboard updates or buzzer toggles) instantly, even while processing heavy video frames.
+
+### 2. Parallel Inference via GIL Release
+- **Concept**: Leveraged the fact that **OpenCV** and **PyTorch** (underlying YOLO) release the Python Global Interpreter Lock (GIL) during heavy C++ operations.
+- **Result**: Achieved **True Parallelism**. The AI model runs on a separate CPU core/thread while the web server handles network traffic on the main core, maximizing hardware utilization.
+
+### 3. Latency-Free Database Logging
+- **Problem**: Writing every incident to the database sequentially adds latency (disk I/O) to the video processing loop.
+- **Solution**: Implemented FastAPI's `BackgroundTasks`.
+- **Result**: Incident logs and analytics are saved **after** the video frame is sent to the client. This ensures zero impact on the video streaming frame rate.
+
+### 4. Kafka Video Pipeline (22+ FPS)
+- **Architecture**: Implemented a simple Producer and a Consumer that loads latest frame.
+- **Optimization**:
+    - **Producer**: Uses `lz4` compression to blast frames at maximum camera speed.
+    - **Consumer**: Uses `auto_offset_reset='latest'` and a polling strategy that discards old frames (`batch[-1]`).
+- **Impact**: Increased FPS from ~15 (Monolithic) to **20+ FPS** (Distributed) by paralleling the "Read" and "Process" operations across two separate processes on my laptop with RTX 4060.
 
 ## Installation and Usage
 
 ### Prerequisites
 - Python 3.8+
+- Docker & Docker Compose (for Kafka)
 - OpenCV-compatible camera or IP webcam
-- ESP32 (optional, for buzzer alerts)
+- NVIDIA GPU (Optional, for TensorRT acceleration)
 
 ### Setup
-```
+```bash
 git clone https://github.com/PrudhviGudla/Perimeter-Breach-Detection-and-Crowd-Analytics.git
 cd Perimeter-Breach-Detection-and-Crowd-Analytics
 pip install -r requirements.txt
 ```
 
-### Configuration
-1. **Camera Setup**: Configure your camera URL in `.env` file:
-```
-IP_WEBCAM_URL=<url>
-```
-Or use local camera (default: camera index 0)
+### Kafka Setup (Optional for Single Camera, Required for Scalability)
 
-2. **MQTT Configuration**: Update MQTT settings in the code if needed:
+If you want to use the high-performance distributed pipeline:
+
+1. **Start Kafka Cluster**:
+Navigate to the `kafka-test` directory where the docker-compose file resides:
+```bash
+cd kafka-test
+docker-compose up -d
 ```
-mqtt_broker = 'broker.emqx.io'
-mqtt_port = 1883
-mqtt_topic = "esp32/buzzer"
+
+2. **Configure Config**:
+Ensure `config.json` in the config directory has `"USE_KAFKA": true`.
+
+3. **Start the Producer**:
+Open a terminal and run the camera producer:
+```bash
+python src/kafka_producer.py
 ```
+
 
 ### Run the Application
-```
-uvicorn main:app
+
+Start the FastAPI Backend (Consumer):
+
+```bash
+uvicorn src.main:app --reload
 ```
 
 Access the web interface at: `http://localhost:8000`
 
-## ESP32 Buzzer Setup
+### Configuration (`config.json`)
 
-### Hardware Requirements
-- ESP32 development board
-- Active buzzer
-- Jumper wires
-- Breadboard (optional)
+The application uses a centralized `config.json` in the config directory.
 
-### Wiring
-ESP32 Pin D4 ─ Buzzer Positive
-ESP32 GND ─ Buzzer Negative
-
-### Software Setup
-1. Install Arduino IDE with ESP32 board support
-2. Install required libraries:
-   - `PubSubClient` for MQTT
-   - `WiFi` for network connectivity
-3. Flash the provided ESP32 code from `/ESP32` directory
-4. Configure WiFi credentials and MQTT settings
-
-### ESP32 Code Configuration
-```
-const char* ssid = "YOUR_WIFI_SSID";
-const char* password = "YOUR_WIFI_PASSWORD";
-const char* mqtt_server = "broker.emqx.io";
-const char* mqtt_topic = "esp32/buzzer";
-const int buzzerPin = 4; // D4 pin
+```json
+{
+  "USE_KAFKA": true,
+  "KAFKA_BOOTSTRAP_SERVERS": ["127.0.0.1:9092"],
+  "KAFKA_TOPIC": "video_stream",
+  "IP_WEBCAM_URL": "0",
+  "MODEL_PATH": "assets/yolov8l.pt",
+  "STATIC_DIR": "static",
+  "TEMPLATES_DIR": "templates",
+  "ASSETS_DIR": "assets",
+  "DB_PATH": "assets/perimeter_detection.db",
+  "MQTT_BROKER": "broker.emqx.io",
+  "MQTT_PORT": 1883,
+  "MQTT_TOPIC": "esp32/buzzer"
+}
 ```
 
-### Basic Operation
-1. **Start Application**: Run `uvicorn main:app`
-2. **Access Web Interface**: Open `http://localhost:8000`
-3. **Draw Perimeter**: Click "Set Perimeter" and draw your restricted zone
-4. **Monitor**: Watch real-time detection and analytics
+## Folder Structure
 
-### Perimeter Management
-- **Draw**: Click "Set Perimeter" → Click points → Double-click to finish
-- **Save**: Click "Save Current Perimeter" after drawing
-- **Load**: Select from dropdown to load saved perimeters
-- **Delete**: Select perimeter and click "Delete Selected"
+```
+├── assets/                 # Logs, database file, and model artifacts
+├── config/                 # Local runtime configuration
+│   └── config.json         # Main configuration used by the app (KAFKA, MODEL_PATH, MQTT, etc.)
+├── src/                    # Application source code
+│   ├── main.py             # FastAPI backend, inference & consumer logic
+│   ├── kafka_producer.py   # Kafka producer script 
+│   ├── sort.py             # SORT tracking implementation
+├── kafka-test/             # Local Kafka test environment (docker-compose + example scripts)
+├── static/                 # Web static assets: CSS, JS, images
+├── templates/              # Jinja2 HTML templates
+├── tensorrt_optimization/  # Notebooks and assets to build TensorRT engines
+│   ├── TENSORRT_SETUP.md   # Platform-specific TensorRT install notes (Windows)
+│   ├── build_tensorrt_engine.ipynb  # Notebook to convert models to .engine (FP16/INT8) and analyze performance
+│   └── assets/             # Generated ONNX / engine files (yolov8l_fp16.engine, yolov8l_int8.engine)
+├── ESP32/                  # ESP32 related code
+│   └── MQTT_buzzer.ino     # Arduino sketch to receive MQTT buzzer messages
+├── requirements.txt        # Python dependencies
+└── README.md
+```
 
-## Technical Details
+## 🚀 Performance Optimization (TensorRT)
 
-### Dependencies
-- **FastAPI**: Modern web framework for APIs
-- **OpenCV**: Computer vision and video processing
-- **Ultralytics YOLOv8**: State-of-the-art object detection
-- **SORT**: Multi-object tracking algorithm
-- **SQLAlchemy**: Database ORM for data persistence
-- **Paho-MQTT**: MQTT client for IoT communication
-- **Shapely**: Geometric calculations for perimeter detection
+To enable real-time inference on edge hardware (RTX 4060 Laptop GPU), I migrated the detection pipeline from standard PyTorch (`.pt`) to NVIDIA TensorRT (`.engine`).
 
-##  API Endpoints
+### **Methodology**
+* **Post-Training Quantization (PTQ):** Converted YOLOv8l to **INT8** precision, reducing memory bandwidth usage by **~50%**.
+* **Domain-Specific Calibration:** Instead of using generic COCO datasets, I implemented a custom calibration pipeline that extracts 100 random frames from the deployment environment. This ensures the quantization parameters (dynamic range) are optimized specifically for the lighting and object scales of this facility.
+
+> **Note:** While the TensorRT engine is capable of 90+ FPS, the end-to-end application runs at **~20 FPS** in the current build. Profiling confirmed this is due to I/O bottlenecks (video source capture rate) and visualization overhead, proving that the GPU compute is no longer the rate-limiting factor.
+
+## Setup
+
+Follow these steps to set up the environment and run the optimization notebooks.
+
+### **1. Create Virtual Environment**
+```bash
+# Create the environment
+python -m venv venv
+
+# Activate it
+# Windows:
+.\venv\Scripts\activate
+# Linux/WSL:
+source venv/bin/activate
+```
+
+### **2. Install Dependencies & Jupyter Kernel**
+
+```bash
+# Install core requirements
+pip install -r requirements.txt
+
+# Install Jupyter and Kernel helper
+pip install jupyter ipykernel
+
+# Register this venv as a kernel for Jupyter
+python -m ipykernel install --user --name=perimeter_breach --display-name "Perimeter Breach (Python 3.10)"
+```
+
+### **3. Install TensorRT**
+
+**Important:** TensorRT installation on Windows is non-standard and requires specific DLLs (`zlibwapi.dll`) and Path configurations.
+**[Read the TensorRT Installation Guide](tensorrt_optimization/TENSORRT_SETUP.md)**
+
+### **4. Launch Optimization Studio**
+
+```bash
+jupyter notebook
+# Open 'build_tensorrt_engine.ipynb'
+```
+
+## API Endpoints
 
 ### Core Endpoints
-- `GET /` - Web interface
-- `GET /video_feed` - Live video stream
-- `POST /set_shape` - Set current perimeter
-- `GET /get_analytics` - Current analytics data
+
+* `GET /` - Web interface
+* `GET /video_feed` - Live video stream (Kafka Consumer or Direct capture)
+* `POST /set_shape` - Set current perimeter
+* `GET /get_analytics` - Current analytics data
 
 ### Perimeter Management
-- `POST /save_perimeter` - Save new perimeter
-- `GET /get_perimeters` - List saved perimeters  
-- `POST /load_perimeter/{id}` - Load specific perimeter
-- `DELETE /delete_perimeter/{id}` - Delete perimeter
 
-### Control Endpoints
-- `POST /toggle_buzzer` - Control buzzer state
-- `GET /get_buzzer_state` - Get current buzzer status
+* `POST /save_perimeter` - Save new perimeter (Threaded)
+* `GET /get_perimeters` - List saved perimeters (Threaded)
+* `POST /load_perimeter/{id}` - Load specific perimeter (Threaded)
+* `DELETE /delete_perimeter/{id}` - Delete perimeter (Threaded)
 
-## Acknowledgments
+### Buzzer Control Endpoints
 
-- **Ultralytics** for YOLOv8 object detection
-- **SORT** tracking algorithm contributors
-- **FastAPI** framework developers
-- **OpenCV** computer vision library
-- **EMQX** for free MQTT broker services
-
-
-## Future Enhancements
-- **Multi-Camera Support**: Handle multiple camera feeds simultaneously
-- **Cloud Integration**: AWS/Azure cloud deployment options
-- **Advanced Analytics**: Dwell time analysis, and trajectory tracking
-- **Mobile App**: Companion mobile application for remote monitoring
-
+* `POST /toggle_buzzer` - Control buzzer state
+* `GET /get_buzzer_state` - Get current buzzer status

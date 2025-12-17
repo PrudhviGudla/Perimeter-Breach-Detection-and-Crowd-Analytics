@@ -182,3 +182,6 @@ h1 {
 #perimeter-select-container button {
     margin-left: 10px;
 }
+
+#system-status { font-family: Arial, sans-serif; font-size: 14px; color: #ffffff; }
+#system-status div { background: rgba(255,255,255,0.03); padding: 6px 8px; border-radius: 4px; }

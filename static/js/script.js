@@ -500,3 +500,24 @@ function debugVideoDimensions() {
 
 setInterval(debugVideoDimensions, 5000);
 
+// Perf polling: update #device and #fps every second
+(function () {
+  async function updatePerf() {
+    try {
+      const resp = await fetch('/get_perf');
+      if (!resp.ok) throw new Error('Network response was not ok');
+      const data = await resp.json();
+      const deviceEl = document.getElementById('device');
+      const fpsEl = document.getElementById('fps');
+      if (deviceEl) deviceEl.textContent = data.device ?? 'unknown';
+      if (fpsEl) fpsEl.textContent = (data.fps !== undefined) ? data.fps : '0';
+    } catch (err) {
+      console.error('Failed to fetch perf:', err);
+    }
+  }
+
+  // initial fetch + interval
+  updatePerf();
+  setInterval(updatePerf, 1000);
+})();
+

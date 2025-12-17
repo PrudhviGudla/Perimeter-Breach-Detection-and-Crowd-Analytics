@@ -1,0 +1,16 @@
+{
+  "USE_KAFKA": true,
+  "KAFKA_BOOTSTRAP_SERVERS": ["127.0.0.1:9092"],
+  "KAFKA_TOPIC": "video_stream",
+  "IP_WEBCAM_URL": "0",
+  "MODEL_PATH1": "assets/yolov8l.pt",
+  "MODEL_PATH": "tensorrt_optimization/assets/yolov8l_fp16.engine",
+  "MODEL_PATH2": "tensorrt_optimization/assets/yolov8l_int8.engine",
+  "STATIC_DIR": "static",
+  "TEMPLATES_DIR": "templates",
+  "ASSETS_DIR": "assets",
+  "DB_PATH": "assets/perimeter_detection.db",
+  "MQTT_BROKER": "broker.emqx.io",
+  "MQTT_PORT": 1883,
+  "MQTT_TOPIC": "esp32/buzzer"
+}

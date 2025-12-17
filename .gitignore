@@ -10,6 +10,13 @@ yolov8l.pt
 perimeter_detection.db
 app.log
 pb_env/
+venv/
+assets/
+src/__pycache__
+tensorrt_optimization/assets
+tensorrt_optimization/.ipynb_checkpoints
+tensorrt_optimization/calibration_data
+tensorrt_optimization/benchmark_chart.png
 
 # Distribution / packaging
 .Python

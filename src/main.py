@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, Body, Depends, BackgroundTasks
+from fastapi import FastAPI, Request, Body, Depends, BackgroundTasks, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
@@ -15,7 +15,6 @@ import os
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 from ultralytics import YOLO
-from sort import *
 import uvicorn
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean
 from sqlalchemy.ext.declarative import declarative_base
@@ -23,29 +22,90 @@ from sqlalchemy.orm import sessionmaker, Session
 import json
 from typing import Annotated
 import asyncio
-import signal
-import sys
 import os
-
+import torch 
+from kafka import KafkaConsumer
+from pathlib import Path
+try:
+    from sort import Sort
+except ImportError:
+    from src.sort import Sort  # Adjusted import for local module
+    
 # Load environment variables
-load_dotenv()
+# load_dotenv()
 
-# logging
+# Project root (two levels up from this file: project/ src/ main.py)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# Ensuring assets folder exists for logs / db
+assets_dir = PROJECT_ROOT / 'assets'
+assets_dir.mkdir(parents=True, exist_ok=True)
+
+# Logging (file inside project assets)
+log_file = assets_dir / 'app.log'
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('app.log')
+        logging.FileHandler(str(log_file))
     ]
 )
 logger = logging.getLogger(__name__)
 
-mqtt_client = mqtt.Client(client_id="perimeter_detection_backend")
-mqtt_broker = 'broker.emqx.io'
-mqtt_port = 1883
-mqtt_topic = "esp32/buzzer"
 
+def load_config():
+    """Load project config from project-root config.json with sensible defaults."""
+    config_path = PROJECT_ROOT / 'config' / 'config.json'
+    defaults = {
+        "USE_KAFKA": False,
+        "KAFKA_BOOTSTRAP_SERVERS": ["127.0.0.1:9092"],
+        "KAFKA_TOPIC": "video_stream2",
+        "IP_WEBCAM_URL": "0",
+        "MODEL_PATH": str(PROJECT_ROOT / 'assets' / 'yolov8l.pt'),
+        "STATIC_DIR": str(PROJECT_ROOT / 'static'),
+        "TEMPLATES_DIR": str(PROJECT_ROOT / 'templates'),
+        "ASSETS_DIR": str(assets_dir),
+        "DB_PATH": str(PROJECT_ROOT / 'assets' / 'perimeter_detection.db'),
+        "MQTT_BROKER": "broker.emqx.io",
+        "MQTT_PORT": 1883
+    }
+
+    if config_path.exists():
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to read config.json, using defaults: {e}")
+            cfg = {}
+    else:
+        logger.info(f"No config.json found at {config_path}, using defaults")
+        cfg = {}
+
+    # Merge defaults
+    for k, v in defaults.items():
+        cfg.setdefault(k, v)
+
+    # Normalize booleans and paths
+    cfg['USE_KAFKA'] = bool(cfg.get('USE_KAFKA', False))
+    # Ensure directory paths are absolute strings
+    for path_key in ('STATIC_DIR', 'TEMPLATES_DIR', 'ASSETS_DIR', 'MODEL_PATH', 'DB_PATH'):
+        cfg[path_key] = str(PROJECT_ROOT / cfg[path_key]) if not Path(cfg[path_key]).is_absolute() else str(cfg[path_key])
+
+    # KAFKA_BOOTSTRAP_SERVERS may be a list or comma-separated string
+    bservers = cfg.get('KAFKA_BOOTSTRAP_SERVERS')
+    if isinstance(bservers, str):
+        cfg['KAFKA_BOOTSTRAP_SERVERS'] = [s.strip() for s in bservers.split(',') if s.strip()]
+
+    return cfg
+
+# Load configuration once
+CONFIG = load_config()
+
+mqtt_client = mqtt.Client(client_id="perimeter_detection_backend")
+mqtt_broker = CONFIG.get('MQTT_BROKER', 'broker.emqx.io')
+mqtt_port = CONFIG.get('MQTT_PORT', 1883)
+mqtt_topic = CONFIG.get('MQTT_TOPIC', 'esp32/buzzer')
+SERVER_RUNNING = True  # Global flag to control infinite loops
 
 class AppState:
     def __init__(self):
@@ -58,6 +118,7 @@ class AppState:
             "unusualBehavior": False,
             "behaviorDetails": []
         }
+
 app_state = AppState()
 
 class ResourceManager:
@@ -70,17 +131,25 @@ class ResourceManager:
         self.mqtt_client = None
         self.model = None
         self.tracker = None
+        self.kafka_consumer = None
+        self.use_kafka = bool(CONFIG.get("USE_KAFKA", False))
+        # device and fps 
+        self.device = "cpu"
+        self.fps_window_count = 0
+        self.fps_window_start = time.time()
+        self.last_fps = 0.0
         
     def initialize_database(self):
         """Initialize database connection and create tables"""
         try:
-            db_path = 'perimeter_detection.db'
+            db_path = CONFIG.get('DB_PATH', str(PROJECT_ROOT / 'assets' / 'perimeter_detection.db'))
+            db_dir = Path(db_path).parent
+            db_dir.mkdir(parents=True, exist_ok=True)
             self.engine = create_engine(f'sqlite:///{db_path}', echo=True)
-            logger.info(f"Database path: {os.path.abspath(db_path)}")
+            logger.info(f"Database path: {db_path}")
             Base.metadata.create_all(self.engine)
             self.Session = sessionmaker(bind=self.engine)
             logger.info("Database initialized successfully")
-            
             # Initialize test data
             self._initialize_test_data()
             
@@ -119,20 +188,73 @@ class ResourceManager:
             session.close()
     
     def initialize_camera(self):
-        """Initialize camera connection"""
-        ip_cam_url = os.getenv('IP_WEBCAM_URL', '0')
-        self.cap = cv2.VideoCapture(ip_cam_url)
-        
-        if not self.cap.isOpened():
-            logger.warning(f"Failed to connect to IP webcam at {ip_cam_url}")
-            self.cap = cv2.VideoCapture(0)
-            if not self.cap.isOpened():
-                logger.error("Failed to open any camera source")
-                self.cap = None
+        """Initialize Camera OR Kafka Consumer based on config"""
+        if self.use_kafka:
+            print("Connecting to Kafka...")
+            try:
+                # Simple Consumer Setup
+                self.kafka_consumer = KafkaConsumer(
+                    CONFIG.get('KAFKA_TOPIC', 'video_stream2'),
+                    bootstrap_servers=CONFIG.get('KAFKA_BOOTSTRAP_SERVERS', ['127.0.0.1:9092']), # Force IPv4
+                    auto_offset_reset='latest',           # Start at end of stream
+                    group_id=None,                        # No group = No committing offsets = Faster
+                    fetch_max_bytes=10 * 1024 * 1024     # Allow 10MB frames
+                )
+                print("Kafka Connected!")
+                return True
+            except Exception as e:
+                print(f"Kafka Error: {e}")
                 return False
+        else:
+            logger.info("Initializing Camera mode...")
+            ip_cam_url = CONFIG.get('IP_WEBCAM_URL', '0')
+            self.cap = cv2.VideoCapture(ip_cam_url)
+            
+            if not self.cap.isOpened():
+                logger.warning(f"Failed to connect to IP webcam at {ip_cam_url}")
+                self.cap = cv2.VideoCapture(0)
+                if not self.cap.isOpened():
+                    logger.error("Failed to open any camera source")
+                    self.cap = None
+                    return False
+            
+            logger.info("Camera initialized successfully")
+            return True
         
-        logger.info("Camera initialized successfully")
-        return True
+    def read_frame(self):
+        """Unified interface to read from Camera or Kafka"""
+        if self.use_kafka:
+            if not self.kafka_consumer: return False, None
+            
+            # POLL: Check for new data (Timeout 20ms)
+            raw_msgs = self.kafka_consumer.poll(timeout_ms=20)
+            
+            if not raw_msgs:
+                return False, None
+
+            # Get the very last message from the batch
+            for tp, messages in raw_msgs.items():
+                if messages:
+                    last_msg = messages[-1]
+                    # Decode
+                    nparr = np.frombuffer(last_msg.value, np.uint8)
+                    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    return True, frame
+            
+            return False, None
+        else:
+            if self.cap and self.cap.isOpened():
+                return self.cap.read()
+            return False, None
+        
+    def is_source_ready(self):
+        """
+        Checks if the currently selected source (Kafka or Camera) is valid.
+        """
+        if self.use_kafka:
+            return self.kafka_consumer is not None
+        else:
+            return self.cap is not None and self.cap.isOpened()
     
     def initialize_mqtt(self):
         """Initialize MQTT client"""
@@ -151,7 +273,9 @@ class ResourceManager:
         self.mqtt_client.on_disconnect = on_disconnect
         
         try:
-            self.mqtt_client.connect('broker.emqx.io', 1883, 60)
+            broker = CONFIG.get('MQTT_BROKER', 'broker.emqx.io')
+            port = CONFIG.get('MQTT_PORT', 1883)
+            self.mqtt_client.connect(broker, port, 60)
             self.mqtt_client.loop_start()
             logger.info("MQTT client started")
             return True
@@ -160,18 +284,96 @@ class ResourceManager:
             return False
     
     def initialize_ai_models(self):
-        """Initialize YOLO model and SORT tracker"""
+        """Initialize YOLO model and SORT tracker and detect device (GPU/CPU)"""
         try:
-            self.model = YOLO("yolov8l.pt")
-            self.model.fuse()
+            use_cuda = torch.cuda.is_available()
+            self.device = "cuda" if use_cuda else "cpu"
+            logger.info(f"torch.cuda.is_available(): {use_cuda}; using device: {self.device}")
+
+            # load model (decide based on extension)
+            model_path = CONFIG.get('MODEL_PATH', str(PROJECT_ROOT / 'assets' / 'yolov8l.pt'))
+            model_path_obj = Path(model_path)
+
+            if model_path_obj.suffix.lower() == '.engine':
+                logger.info("Detected TensorRT engine file. Skipping ultralytics loader.")
+                self.model_type = 'tensorrt'
+                self.model = YOLO(model_path)
+            else:
+                logger.info(f"Loading PyTorch model at {model_path}")
+                self.model_type = 'pytorch'
+                self.model = YOLO(model_path)
+                self.model.fuse()
+
+                try:
+                    if use_cuda:
+                        self.model.to('cuda:0')
+                    else:
+                        self.model.to('cpu')
+                except Exception:
+                    logger.debug("Failed to set model device; continuing")
+
+            # initialize tracker
             self.tracker = Sort(max_age=20, min_hits=3, iou_threshold=0.3)
-            self.CLASS_NAMES_DICT = self.model.model.names
+
+            # Load a single canonical classes file under assets: 'assets/model_classes.json'
+            class_names_file = PROJECT_ROOT / 'assets' / 'model_classes.json'
+            names_mapping = None
+            if class_names_file.exists():
+                try:
+                    names_mapping = json.loads(class_names_file.read_text(encoding='utf-8'))
+                    logger.info(f"Loaded class names from {class_names_file}")
+                except Exception as e:
+                    logger.warning(f"Failed to load {class_names_file}: {e}")
+
+            # If missing and we have a PyTorch model, try extracting and save with string keys
+            if not names_mapping and getattr(self, 'model_type', '') == 'pytorch' and self.model is not None:
+                try:
+                    extracted = getattr(self.model, 'model', None)
+                    if extracted is not None and hasattr(extracted, 'names'):
+                        names_mapping = {str(k): v for k, v in extracted.names.items()}
+                        try:
+                            class_names_file.write_text(json.dumps(names_mapping, indent=2), encoding='utf-8')
+                            logger.info(f"Saved extracted class names to {class_names_file}")
+                        except Exception:
+                            logger.debug("Could not save extracted class names")
+                except Exception as e:
+                    logger.warning(f"Failed to extract names from model: {e}")
+
+            # Final fallback
+            if not names_mapping:
+                logger.warning("No class names found; creating numeric fallback mapping")
+                names_mapping = {"0": "person"}
+                try:
+                    class_names_file.write_text(json.dumps(names_mapping, indent=2), encoding='utf-8')
+                except Exception:
+                    pass
+
+            # Keep mapping with string keys (so detect_and_track can do str lookups reliably)
+            self.CLASS_NAMES_DICT = {str(k): v for k, v in names_mapping.items()}
+
+            # self.CLASS_NAMES_DICT = {"0": "person"}  # Forcing only person class for this application
+
+            # expose to analytics state
+            app_state.analytics["device"] = self.device
+
             logger.info("AI models initialized successfully")
             return True
         except Exception as e:
             logger.error(f"Failed to initialize AI models: {e}")
             return False
     
+    def update_fps(self):
+        """Calculates FPS and updates app_state"""
+        self.fps_window_count += 1
+        now = time.time()
+        elapsed = now - self.fps_window_start
+        if elapsed >= 1.0:
+            self.last_fps = self.fps_window_count / elapsed
+            self.fps_window_count = 0
+            self.fps_window_start = now
+            # Update the global state directly
+            app_state.analytics["fps"] = round(self.last_fps, 2)
+
     def cleanup(self):
         """Clean up all resources"""
         if self.cap and self.cap.isOpened():
@@ -179,29 +381,44 @@ class ResourceManager:
         if self.mqtt_client:
             self.mqtt_client.loop_stop()
             self.mqtt_client.disconnect()
+        if self.kafka_consumer: 
+            self.kafka_consumer.close() 
         logger.info("Resources cleaned up")
 
 # Create global resource manager
 resource_manager = ResourceManager()
 
+# For handling MQTT messages
+class MQTTHandler:
+    @staticmethod
+    def send_buzzer_signal(state: bool):
+        """Simplified MQTT signal sending"""
+        if not resource_manager.mqtt_client:
+            logger.error("MQTT client not initialized")
+            return False
+        
+        try:
+            message = "ON" if state else "OFF"
+            result = resource_manager.mqtt_client.publish("esp32/buzzer", message)
+            success = result.rc == mqtt.MQTT_ERR_SUCCESS
+            logger.info(f"Buzzer {message} signal sent: {'success' if success else 'failed'}")
+            return success
+        except Exception as e:
+            logger.error(f"Failed to send MQTT message: {e}")
+            return False
 
-shutdown_event = asyncio.Event()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifecycle with proper shutdown handling"""
+    """
+    Clean, standard lifecycle management. 
+    Let Uvicorn handle the signals; we just handle resources.
+    """
+    global SERVER_RUNNING
     
-    # Setup signal handlers that work with asyncio
-    def signal_handler(sig, frame):
-        logger.info(f"Received signal {sig}, initiating shutdown...")
-        shutdown_event.set()
-    
-    # Install handlers
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    if sys.platform.startswith('win'):
-        signal.signal(signal.SIGBREAK, signal_handler)
-    
+    # --- STARTUP ---
     logger.info("Application starting up...")
+    SERVER_RUNNING = True
     
     # Initialize resources
     resource_manager.initialize_database()
@@ -209,32 +426,22 @@ async def lifespan(app: FastAPI):
     resource_manager.initialize_mqtt()
     resource_manager.initialize_ai_models()
     
-    try:
-        yield
-    finally:
-        # Cleanup
-        logger.info("Application shutting down...")
-        resource_manager.cleanup()
-        
-        # Cancel remaining tasks
-        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-        if tasks:
-            logger.info(f"Cancelling {len(tasks)} outstanding tasks")
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-
-# app initialization
-app = FastAPI(lifespan=lifespan)
-templates = Jinja2Templates(directory="templates")
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
+    yield  # The application runs here
+    
+    # --- SHUTDOWN ---
+    logger.info("Application shutting down...")
+    SERVER_RUNNING = False  # Tells video_feed loop to break immediately
+    
+    # Allow a brief moment for the loop to break before destroying resources
+    await asyncio.sleep(0.5) 
+    
+    resource_manager.cleanup()
+    logger.info("Shutdown complete.")
 
 def get_session():
     """Database session dependency"""
     if not resource_manager.Session:
-        raise RuntimeError("Database not initialized")
+        raise HTTPException(status_code=503, detail="Database not initialized")
     
     session = resource_manager.Session()
     try:
@@ -245,9 +452,14 @@ def get_session():
         raise
     finally:
         session.close()
+
+
+# App initialization
+app = FastAPI(lifespan=lifespan)
+# Use absolute paths from CONFIG so app works when run from src or project root
+templates = Jinja2Templates(directory=CONFIG.get('TEMPLATES_DIR', str(PROJECT_ROOT / 'templates')))
+app.mount("/static", StaticFiles(directory=CONFIG.get('STATIC_DIR', str(PROJECT_ROOT / 'static'))), name="static")
 SessionDep = Annotated[Session, Depends(get_session)]
-
-
 Base = declarative_base()
 
 class Analytics(Base):
@@ -273,7 +485,6 @@ class Perimeter(Base):
     name = Column(String)
     points = Column(String)  
     timestamp = Column(DateTime)
-
 
 # Saving Data to database
 def save_analytics_to_db_sync(analytics_data: Dict[str, Any]):
@@ -350,7 +561,15 @@ def detect_and_track(frame):
     try:
         logger.debug("Starting object detection and tracking")
         detections = np.empty((0, 5))
-        results = resource_manager.model(frame, stream=True)
+        # results = resource_manager.model(frame, stream=True)
+        results = resource_manager.model(
+            frame, 
+            stream=True, 
+            classes=[0],      # 0 is 'person' in COCO dataset
+            imgsz=640,        # Lower resolution for inference (faster)
+            conf=0.4,          # Slightly higher confidence threshold to reduce noise
+            device = 0
+        )
 
         for r in results:
             boxes = r.boxes
@@ -358,8 +577,8 @@ def detect_and_track(frame):
                 x1, y1, x2, y2 = box.xyxy[0]
                 x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
                 
-                cls = int(box.cls[0])
-                currentClass = resource_manager.CLASS_NAMES_DICT[cls]
+                cls = box.cls[0]
+                currentClass = resource_manager.CLASS_NAMES_DICT.get(str(cls), f"person")
                 conf = math.ceil(box.conf[0] * 100) / 100
 
                 if conf > 0.5 and currentClass == "person":
@@ -477,86 +696,86 @@ def check_region(tracked_objects, polygon_points, frame):
 
     return person_in_region, incidents_to_save
 
-
-# For handling MQTT messages
-class MQTTHandler:
-    @staticmethod
-    def send_buzzer_signal(state: bool):
-        """Simplified MQTT signal sending"""
-        if not resource_manager.mqtt_client:
-            logger.error("MQTT client not initialized")
-            return False
-        
-        try:
-            message = "ON" if state else "OFF"
-            result = resource_manager.mqtt_client.publish("esp32/buzzer", message)
-            success = result.rc == mqtt.MQTT_ERR_SUCCESS
-            logger.info(f"Buzzer {message} signal sent: {'success' if success else 'failed'}")
-            return success
-        except Exception as e:
-            logger.error(f"Failed to send MQTT message: {e}")
-            return False
+def process_frame_pipeline(frame):
+    """
+    Runs Detection, Drawing, AND Encoding in a single synchronous block.
+    This runs inside one worker thread to minimize context switching.
+    """
+    tracked_objects = detect_and_track(frame)
+    person_in_region, incidents = check_region(tracked_objects, app_state.shape_coordinates, frame)
+    ret, buffer = cv2.imencode('.jpg', frame)
+    return buffer, incidents, tracked_objects
 
 
-# web app routes
+# Web app routes
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     return templates.TemplateResponse("index.html",
                                       {"request": request})
 
 @app.get("/video_feed")
-def video_feed(background_tasks: BackgroundTasks): 
-    def generate():
-        while True:
+async def video_feed(request: Request, background_tasks: BackgroundTasks):
+    async def generate():
+        while SERVER_RUNNING:
             try:
-                if not resource_manager.cap or not resource_manager.cap.isOpened():
-                    # Return error frame
+                if await request.is_disconnected():
+                    logger.info("Client disconnected from video feed")
+                    break
+
+                if not resource_manager.is_source_ready():
+                    # Generate Error Frame
                     blank_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                    cv2.putText(blank_frame, "Camera Not Available", (180, 240),
-                               cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-                    ret, buffer = cv2.imencode('.jpg', blank_frame)
-                    frame_bytes = buffer.tobytes()
+                    msg = "Kafka Connecting..." if resource_manager.use_kafka else "Camera Not Available"
+                    cv2.putText(blank_frame, msg, (150, 240),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                    
+                    ret, buffer = await asyncio.to_thread(cv2.imencode, '.jpg', blank_frame)
                     yield (b'--frame\r\n'
-                           b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-                    time.sleep(1)
+                           b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+                    
+                    await asyncio.sleep(1)
                     continue
 
-                # Read and process frame (synchronous)
-                success, frame = resource_manager.cap.read()
-                if not success:
+                success, frame = await asyncio.to_thread(resource_manager.read_frame)
+
+                if not success or frame is None:
+                    # If Kafka queue is empty or Camera fails, wait briefly
+                    await asyncio.sleep(0.01)
                     continue
 
-                tracked_objects = detect_and_track(frame)
-                person_in_region, incidents = check_region(tracked_objects, app_state.shape_coordinates, frame)
+                buffer, incidents, tracked_objects = await asyncio.to_thread(process_frame_pipeline, frame)
 
-                if incidents or app_state.analytics["unusualBehavior"]:
+                if incidents or app_state.analytics.get("unusualBehavior"):
                     background_tasks.add_task(
-                        save_data_sync, 
-                        incidents, 
+                        save_data_sync,
+                        incidents,
                         app_state.analytics.copy()
                     )
 
-                ret, buffer = cv2.imencode('.jpg', frame)
-                frame_bytes = buffer.tobytes()
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-                
-                time.sleep(0.033)  # ~30 FPS
-                
-            except Exception as e:
-                logger.error(f"Error processing frame: {e}")
-                time.sleep(0.1)
+                resource_manager.update_fps()
 
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+
+                # await asyncio.sleep(0) allows other routes (like /toggle_buzzer) 
+                await asyncio.sleep(0)
+
+            except Exception as e:
+                logger.error(f"Error in video feed loop: {e}")
+                # Backoff slightly on error to prevent log spamming
+                await asyncio.sleep(0.1)
+
+        logger.info("Video feed generator exiting")
+        
     return StreamingResponse(generate(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 @app.post("/toggle_buzzer")
-async def toggle_buzzer():
+def toggle_buzzer():
     app_state.buzzer_on = not app_state.buzzer_on
     success = MQTTHandler.send_buzzer_signal(app_state.buzzer_on)
     return JSONResponse({
         "buzzer_on": app_state.buzzer_on, 
-        "mqtt_success": success
-    })
+        "mqtt_success": success })
 
 @app.get("/get_analytics")
 async def get_analytics():
@@ -573,7 +792,7 @@ async def get_buzzer_state():
     return JSONResponse({"buzzer_on": app_state.buzzer_on})
 
 @app.post("/save_perimeter")
-async def save_perimeter(data: dict = Body(...), session: SessionDep = None):
+def save_perimeter(data: dict = Body(...), session: SessionDep = None):
     """Save perimeter configuration"""
     try:
         perimeter = Perimeter(
@@ -590,7 +809,7 @@ async def save_perimeter(data: dict = Body(...), session: SessionDep = None):
         return {"status": "error", "message": str(e)}
 
 @app.get("/get_perimeters")
-async def get_perimeters(session: SessionDep = None):
+def get_perimeters(session: SessionDep = None):
     """Get all saved perimeters"""
     try:
         perimeters = session.query(Perimeter).all()
@@ -606,7 +825,7 @@ async def get_perimeters(session: SessionDep = None):
         return {"status": "error", "message": str(e)}
 
 @app.post("/load_perimeter/{perimeter_id}")
-async def load_perimeter(perimeter_id: int, session: SessionDep = None):
+def load_perimeter(perimeter_id: int, session: SessionDep = None):
     """Load a saved perimeter and set it as current"""
     try:
         perimeter = session.query(Perimeter).filter(Perimeter.id == perimeter_id).first()
@@ -628,7 +847,7 @@ async def load_perimeter(perimeter_id: int, session: SessionDep = None):
         return {"status": "error", "message": str(e)}
 
 @app.delete("/delete_perimeter/{perimeter_id}")
-async def delete_perimeter(perimeter_id: int, session: SessionDep = None):
+def delete_perimeter(perimeter_id: int, session: SessionDep = None):
     """Delete a saved perimeter"""
     try:
         perimeter = session.query(Perimeter).filter(Perimeter.id == perimeter_id).first()
@@ -643,7 +862,13 @@ async def delete_perimeter(perimeter_id: int, session: SessionDep = None):
         logger.error(f"Error deleting perimeter: {e}")
         return {"status": "error", "message": str(e)}
 
+@app.get("/get_perf")
+async def get_perf():
+    return JSONResponse({
+        "device": getattr(resource_manager, "device", "unknown"),
+        "fps": app_state.analytics.get("fps", 0) })
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, timeout_graceful_shutdown=0)
+

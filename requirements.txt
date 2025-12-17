@@ -1,3 +1,7 @@
+# --index-url https://download.pytorch.org/whl/cu124
+# torch
+# torchvision
+# torchaudio
 fastapi
 uvicorn
 jinja2
@@ -13,3 +17,5 @@ filterpy
 argparse
 sqlalchemy
 paho-mqtt
+kafka-python
+lz4
